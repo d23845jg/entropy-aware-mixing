@@ -61,6 +61,12 @@ distillation_loss:
   # Upper bound for PPO clipping ratio.
   clip_ratio_high: 0.2
 
+  # Auxiliary EOPD forward-KL parameters for OPD-style training.
+  # Set `eopd_forward_kl_coef > 0` to enable the auxiliary term.
+  # Set `eopd_forward_kl_entropy_threshold` to gate it by teacher entropy (EOPD-style).
+  eopd_forward_kl_coef: 0.0
+  eopd_forward_kl_entropy_threshold: null
+
 
 # teacher model config
 teacher_model:

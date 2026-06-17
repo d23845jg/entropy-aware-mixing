@@ -1060,6 +1060,7 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 if use_eaft_loss:
                     with torch.no_grad():
                         eaft_weight_rmpad = self._compute_eaft_weight_from_logits(logits_rmpad, eaft_k, eaft_alpha)
+
                 # if use_sp: ((total_nnz / sp) + pad) ; if not use_sp: (batch, seqlen)
                 inplace_backward = True
                 if calculate_entropy or use_eaft_loss:
@@ -1152,6 +1153,7 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 temperature = output_args["temperature"]  # (bsz,)
                 temperature = temperature.unsqueeze(-1).unsqueeze(-1)
                 logits.div_(temperature.clamp(min=1e-8).to(logits.dtype))
+
                 if calculate_entropy:
                     if not self.engine_config.entropy_checkpointing:
                         entropy = verl_F.entropy_from_logits(logits)

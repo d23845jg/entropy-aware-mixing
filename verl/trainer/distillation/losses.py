@@ -294,6 +294,61 @@ def _compute_forward_kl_tensors_and_metrics(
     return distillation_losses, metrics
 
 
+def compute_forward_kl_auxiliary_loss(
+    config: ActorConfig,
+    distillation_config: DistillationConfig,
+    model_output: dict,
+    data: TensorDict,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """Compute the optional forward-KL auxiliary loss used by OPD-style training."""
+    forward_kl_losses, metrics = _compute_forward_kl_tensors_and_metrics(
+        distillation_config=distillation_config,
+        model_output=model_output,
+        data=data,
+    )
+    response_mask = data["response_mask"]
+    response_mask_bool = response_mask.bool()
+    entropy_threshold = (
+        distillation_config.distillation_loss.eopd_forward_kl_entropy_threshold
+    )
+
+    if entropy_threshold is not None:
+        if data.get("teacher_logprobs", None) is None:
+            raise ValueError(
+                "Entropy-gated EOPD forward-KL requires data['teacher_logprobs'] from the teacher query."
+            )
+        teacher_topk_log_probs = no_padding_2_padding(data["teacher_logprobs"], data)
+        teacher_normalized_log_probs, teacher_normalized_probs = normalize_log_probs(
+            teacher_topk_log_probs
+        )
+        teacher_entropy_proxy = -(
+            teacher_normalized_probs * teacher_normalized_log_probs
+        ).sum(dim=-1)
+        gate = teacher_entropy_proxy > entropy_threshold
+        forward_kl_losses = forward_kl_losses * gate.to(forward_kl_losses.dtype)
+        metrics.update(
+            {
+                "distillation/forward_kl_gate_ratio": gate[response_mask_bool]
+                .float()
+                .mean()
+                .item(),
+                "distillation/teacher_entropy_proxy": teacher_entropy_proxy[
+                    response_mask_bool
+                ]
+                .mean()
+                .item(),
+            }
+        )
+
+    auxiliary_loss = agg_loss(
+        loss_mat=forward_kl_losses,
+        loss_mask=response_mask,
+        loss_agg_mode=config.loss_agg_mode,
+        **config.global_batch_info,
+    )
+    return auxiliary_loss, metrics
+
+
 def distillation_ppo_loss(
     config: ActorConfig,
     distillation_config: Optional[DistillationConfig],
@@ -431,6 +486,18 @@ def distillation_loss(
             loss_agg_mode=loss_agg_mode,
             **config.global_batch_info,
         )
+
+    if loss_config.eopd_forward_kl_coef > 0:
+        auxiliary_loss, auxiliary_metrics = compute_forward_kl_auxiliary_loss(
+            config=config,
+            distillation_config=distillation_config,
+            model_output=model_output,
+            data=data,
+        )
+        distillation_loss = (
+            distillation_loss + loss_config.eopd_forward_kl_coef * auxiliary_loss
+        )
+        distillation_metrics.update(auxiliary_metrics)
 
     return distillation_loss, distillation_metrics
 

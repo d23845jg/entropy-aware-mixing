@@ -79,6 +79,10 @@ class DistillationLossConfig(BaseConfig):
     clip_ratio_low: float = 0.2
     clip_ratio_high: float = 0.2
 
+    # Auxiliary EOPD forward-KL configuration for OPD-style training.
+    eopd_forward_kl_coef: float = 0.0
+    eopd_forward_kl_entropy_threshold: Optional[float] = None
+
     # Store global batch info for loss aggregation:
     # dp_size: data parallel size
     # batch_num_tokens: number of valid tokens in global batch
@@ -131,8 +135,34 @@ class DistillationLossConfig(BaseConfig):
                     f"but got topk={self.topk} and teacher_topk={self.teacher_topk}."
                 )
 
+        if (
+            self.eopd_forward_kl_entropy_threshold is not None
+            and self.eopd_forward_kl_coef <= 0
+        ):
+            raise ValueError(
+                "eopd_forward_kl_entropy_threshold requires eopd_forward_kl_coef > 0."
+            )
+
+        if self.eopd_forward_kl_coef > 0:
+            if not self.use_policy_gradient:
+                raise ValueError(
+                    "Auxiliary EOPD forward-KL is only supported on top of the policy-gradient OPD path."
+                )
+            if not self.loss_settings.use_estimator:
+                raise ValueError(
+                    "Auxiliary EOPD forward-KL currently augments estimator-mode distillation losses such as k1."
+                )
+            if self.topk is None:
+                raise ValueError(
+                    "Auxiliary EOPD forward-KL requires distillation.topk to define the teacher support size."
+                )
+
     def requires_teacher_topk_support(self) -> bool:
-        return self.loss_settings.use_topk or self.teacher_topk is not None
+        return (
+            self.loss_settings.use_topk
+            or self.eopd_forward_kl_coef > 0
+            or self.teacher_topk is not None
+        )
 
     def get_teacher_support_topk(self) -> Optional[int]:
         if not self.requires_teacher_topk_support():

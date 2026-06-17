@@ -15,6 +15,7 @@
 import torch
 import torch.nn.functional as F
 
+from verl.trainer.distillation.losses import normalize_log_probs
 from verl.utils.ulysses import (
     get_ulysses_sequence_parallel_world_size,
     slice_input_tensor,
@@ -127,7 +128,9 @@ def compute_forward_kl_topk(
         else min(loss_config.topk, support_size)
     )
     metrics = {"student_mass": student_mass, "teacher_mass": teacher_mass}
-    metrics_only = not loss_config.loss_settings.use_topk
+    metrics_only = (
+        not loss_config.loss_settings.use_topk and loss_config.eopd_forward_kl_coef <= 0
+    )
     metrics["topk_token_overlap"] = _compute_topk_token_overlap(
         student_logits=student_logits,
         teacher_topk_ids=teacher_topk_ids,
@@ -149,6 +152,10 @@ def compute_forward_kl_topk(
         teacher_topk_log_probs=teacher_topk_log_probs_for_loss,
         loss_config=loss_config,
     ).detach()
+
+    teacher_topk_log_probs_for_loss, _ = normalize_log_probs(
+        teacher_topk_log_probs_for_loss
+    )
 
     distillation_losses = _compute_topk_forward_kl(
         student_topk_log_probs=student_topk_log_probs_for_loss,
