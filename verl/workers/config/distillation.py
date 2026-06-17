@@ -51,8 +51,7 @@ class DistillationLossConfig(BaseConfig):
     use_policy_gradient (bool):
         Whether to incorporate distillation loss as a reward, as done
         by https://thinkingmachines.ai/blog/on-policy-distillation/. Recommended to use loss_mode=k1.
-        Otherwise, distillation loss is directly backpropagated as a supervised loss,
-        as in https://arxiv.org/abs/2306.13649. Recommended to use loss_mode=k3 or forward_kl_topk.
+        Otherwise, distillation loss is directly backpropagated as a supervised loss.
     policy_loss_mode (str):
         Name of the policy loss to use when use_policy_gradient is true.
     clip_ratio (float):
@@ -65,7 +64,7 @@ class DistillationLossConfig(BaseConfig):
         Runtime-populated settings based on loss_mode. Not set by user.
     """
 
-    loss_mode: str = "k3"
+    loss_mode: str = "taid_topk"
     topk: Optional[int] = 128
     teacher_topk: Optional[int] = None
     use_task_rewards: bool = True
@@ -73,11 +72,21 @@ class DistillationLossConfig(BaseConfig):
     loss_max_clamp: Optional[float] = 10.0
     log_prob_min_clamp: Optional[float] = -10.0
 
-    use_policy_gradient: bool = True
+    use_policy_gradient: bool = False
     policy_loss_mode: str = "vanilla"
     clip_ratio: float = 0.2
     clip_ratio_low: float = 0.2
     clip_ratio_high: float = 0.2
+
+    # TAID top-k schedule configuration.
+    taid_t_start: float = 0.4
+    taid_t_end: float = 1.0
+    taid_alpha: float = 5e-4
+    taid_beta: float = 0.99
+    taid_disable_adaptive: bool = False
+    taid_t: Optional[float] = None
+    taid_prev_loss: Optional[float] = None
+    taid_momentum: float = 0.0
 
     # Store global batch info for loss aggregation:
     # dp_size: data parallel size
@@ -90,7 +99,9 @@ class DistillationLossConfig(BaseConfig):
     loss_settings: Optional[dict] = None
 
     def __post_init__(self):
-        self._mutable_fields.update({"loss_settings"})
+        self._mutable_fields.update(
+            {"loss_settings", "taid_t", "taid_prev_loss", "taid_momentum"}
+        )
         from verl.trainer.distillation.losses import (
             DistillationLossSettings,
             get_distillation_loss_settings,
@@ -106,13 +117,26 @@ class DistillationLossConfig(BaseConfig):
                 f"but got {self.policy_loss_mode}."
             )
 
-        if self.use_policy_gradient and self.loss_mode == "forward_kl_topk":
-            print(
-                "WARNING: forward_kl_topk is most effective as a supervised distillation loss "
-                "(use_policy_gradient=False). With policy gradient, the update uses only the sampled"
-                " token's logprob ∇logπ(a), so the top-k distributional signal (how non-sampled logits "
-                "should move) is largely unused."
-            )
+        if self.loss_mode == "taid_topk":
+            if self.use_policy_gradient:
+                raise ValueError("taid_topk requires use_policy_gradient=False.")
+            if self.topk is None:
+                raise ValueError(
+                    "taid_topk requires distillation.topk to define the teacher support size."
+                )
+            if not 0.0 <= self.taid_t_start <= self.taid_t_end <= 1.0:
+                raise ValueError(
+                    "TAID schedule must satisfy 0 <= taid_t_start <= taid_t_end <= 1, "
+                    f"got start={self.taid_t_start}, end={self.taid_t_end}."
+                )
+            if not 0.0 <= self.taid_beta < 1.0:
+                raise ValueError(f"taid_beta must be in [0, 1), got {self.taid_beta}.")
+            if self.taid_alpha < 0.0:
+                raise ValueError(
+                    f"taid_alpha must be non-negative, got {self.taid_alpha}."
+                )
+            if self.taid_t is None:
+                self.taid_t = self.taid_t_start
 
         if not self.use_policy_gradient and self.loss_mode in ("kl", "k1"):
             raise ValueError(

@@ -19,7 +19,8 @@ import torch
 from tensordict import TensorDict
 
 from verl.base_config import BaseConfig
-from verl.trainer.ppo.core_algos import agg_loss, get_policy_loss_fn, kl_penalty
+from verl.trainer.ppo.core_algos import agg_loss, get_policy_loss_fn
+from verl.utils import tensordict_utils as tu
 from verl.utils.metric import AggregationType, Metric
 from verl.workers.config import ActorConfig, DistillationConfig, DistillationLossConfig
 from verl.workers.utils.losses import ppo_loss
@@ -184,6 +185,10 @@ def compute_topk_loss(
 
             distillation_loss_fn = fsdp_losses.compute_forward_kl_topk
         case "megatron":
+            if loss_config.loss_mode == "taid_topk":
+                raise NotImplementedError(
+                    "taid_topk is currently implemented only for the FSDP actor path."
+                )
             if (
                 loss_config.teacher_topk is not None
                 and loss_config.teacher_topk != loss_config.topk
@@ -292,6 +297,50 @@ def _compute_forward_kl_tensors_and_metrics(
     # be slightly negative; keep the previous optimization behavior.
     distillation_losses = distillation_losses.clamp_min(0.0)
     return distillation_losses, metrics
+
+
+def _update_taid_schedule(
+    loss_config: DistillationLossConfig,
+    distillation_loss: torch.Tensor,
+    data: TensorDict,
+) -> dict[str, Any]:
+    if loss_config.loss_mode != "taid_topk":
+        return {}
+
+    current_t = loss_config.taid_t
+    if current_t is None:
+        current_t = loss_config.taid_t_start
+
+    global_step = tu.get_non_tensor_data(data, key="distillation_global_step", default=0)
+    total_steps = tu.get_non_tensor_data(data, key="distillation_total_training_steps", default=0)
+    progress = 0.0
+    if total_steps is not None and total_steps > 0:
+        progress = min(max(float(global_step) / float(total_steps), 0.0), 1.0)
+    t_linear = loss_config.taid_t_start + (loss_config.taid_t_end - loss_config.taid_t_start) * progress
+
+    previous_loss = loss_config.taid_prev_loss
+    loss_value = float(distillation_loss.detach().item())
+    momentum = loss_config.taid_momentum
+    delta_t = 0.0
+
+    if not loss_config.taid_disable_adaptive and previous_loss is not None:
+        denom = abs(previous_loss) + 1e-8
+        delta_loss = (previous_loss - loss_value) / denom
+        momentum = loss_config.taid_beta * momentum + (1.0 - loss_config.taid_beta) * delta_loss
+        delta_t = loss_config.taid_alpha * torch.sigmoid(
+            torch.tensor(momentum, dtype=torch.float32)
+        ).item() * (1.0 - current_t)
+
+    next_t = min(loss_config.taid_t_end, max(t_linear, current_t + delta_t))
+    loss_config.taid_t = next_t
+    loss_config.taid_prev_loss = loss_value
+    loss_config.taid_momentum = momentum
+
+    return {
+        "distillation/taid_t": next_t,
+        "distillation/taid_delta_t": next_t - current_t,
+        "distillation/taid_momentum": momentum,
+    }
 
 
 def distillation_ppo_loss(
@@ -432,11 +481,19 @@ def distillation_loss(
             **config.global_batch_info,
         )
 
+    distillation_metrics.update(
+        _update_taid_schedule(
+            loss_config=loss_config,
+            distillation_loss=distillation_loss,
+            data=data,
+        )
+    )
+
     return distillation_loss, distillation_metrics
 
 
 @register_distillation_loss(
-    DistillationLossSettings(names="forward_kl_topk", use_topk=True)
+    DistillationLossSettings(names="taid_topk", use_topk=True)
 )  # type: ignore[arg-type]
 def compute_forward_kl_topk(
     config: ActorConfig,
@@ -455,86 +512,3 @@ def compute_forward_kl_topk(
         model_output=model_output,
         data=data,
     )
-
-
-@register_distillation_loss(
-    DistillationLossSettings(
-        names=["kl", "k1", "abs", "mse", "k2", "low_var_kl", "k3"], use_estimator=True
-    )
-)  # type: ignore[arg-type]
-def compute_distillation_loss_reverse_kl_estimator(
-    config: ActorConfig,
-    distillation_config: DistillationConfig,
-    model_output,
-    data: TensorDict,
-) -> tuple[torch.Tensor, dict[str, Any]]:
-    """
-    Compute the distillation loss and related metrics using single-sample KL estimators.
-
-    Uses the kl_penalty function from core_algos which supports various KL divergence
-    estimators: "kl", "k1", "abs", "mse", "k2", "low_var_kl", "k3".
-    When entropy-aware mixing is enabled, this sampled-logprob estimator path only
-    supports the linear "kl"/"k1" objective. Nonlinear estimators would require
-    a normalized mixed distribution over token support, which is not available here.
-
-    Returns:
-    - distillation_losses: (bsz, resp_len)
-    - distillation_metrics: Dictionary of metrics.
-    """
-    student_log_probs = no_padding_2_padding(model_output["log_probs"], data)
-    teacher_log_probs = data.get("teacher_sampled_logprobs", None)
-    if teacher_log_probs is None:
-        teacher_log_probs = data["teacher_logprobs"]
-    teacher_log_probs = no_padding_2_padding(teacher_log_probs, data)
-    if teacher_log_probs.ndim > student_log_probs.ndim:
-        teacher_log_probs = teacher_log_probs.squeeze(-1)
-    response_mask_bool = data["response_mask"].bool()
-    assert (
-        teacher_log_probs.shape == student_log_probs.shape == response_mask_bool.shape
-    )
-
-    loss_config: DistillationLossConfig = distillation_config.distillation_loss
-    metrics = {}
-    if "student_mass" in model_output and "teacher_mass" in model_output:
-        student_mass = no_padding_2_padding(model_output["student_mass"], data)
-        teacher_mass = no_padding_2_padding(model_output["teacher_mass"], data)
-        metrics.update(
-            _compute_support_mass_metrics(
-                student_mass,
-                teacher_mass,
-                response_mask_bool,
-            )
-        )
-    if "forward_kl" in model_output:
-        forward_kl = no_padding_2_padding(
-            model_output["forward_kl"], data
-        ).clamp_min(0.0)
-        metrics.update(
-            _compute_scalar_metrics(
-                "distillation/forward_kl",
-                forward_kl,
-                response_mask_bool,
-            )
-        )
-    if "topk_token_overlap" in model_output:
-        topk_token_overlap = no_padding_2_padding(
-            model_output["topk_token_overlap"], data
-        )
-        metrics.update(
-            _compute_scalar_metrics(
-                "distillation/topk_token_overlap",
-                topk_token_overlap,
-                response_mask_bool,
-            )
-        )
-
-    distillation_losses = kl_penalty(
-        logprob=student_log_probs,
-        ref_logprob=teacher_log_probs,
-        kl_penalty=loss_config.loss_mode,
-    )
-    # Since k1 can be negative, log the mean absolute loss.
-    metrics["distillation/abs_loss"] = Metric(
-        AggregationType.MEAN, distillation_losses[response_mask_bool].abs().mean()
-    )
-    return distillation_losses, metrics

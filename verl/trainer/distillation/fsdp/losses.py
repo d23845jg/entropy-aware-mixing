@@ -15,6 +15,7 @@
 import torch
 import torch.nn.functional as F
 
+from verl.trainer.distillation.losses import normalize_log_probs
 from verl.utils.ulysses import (
     get_ulysses_sequence_parallel_world_size,
     slice_input_tensor,
@@ -150,11 +151,21 @@ def compute_forward_kl_topk(
         loss_config=loss_config,
     ).detach()
 
-    distillation_losses = _compute_topk_forward_kl(
-        student_topk_log_probs=student_topk_log_probs_for_loss,
-        teacher_topk_log_probs=teacher_topk_log_probs_for_loss,
-        loss_config=loss_config,
-    )
+    if loss_config.loss_mode == "taid_topk":
+        t = loss_config.taid_t
+        if t is None:
+            t = loss_config.taid_t_start
+        mixed_log_scores = (
+            (1.0 - t) * student_topk_log_probs_for_loss.detach()
+            + t * teacher_topk_log_probs_for_loss
+        )
+        taid_log_probs, _ = normalize_log_probs(mixed_log_scores)
+        distillation_losses = kl_divergence(
+            log_q=student_topk_log_probs_for_loss,
+            log_p=taid_log_probs,
+        )
+    else:
+        raise ValueError(f"Unsupported TAID loss mode: {loss_config.loss_mode}")
 
     if metrics_only:
         metrics["distillation_losses"] = torch.zeros_like(student_mass)

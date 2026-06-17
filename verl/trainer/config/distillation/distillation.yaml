@@ -24,7 +24,7 @@ distillation_loss:
 
 
   # Loss function mode for distillation
-  loss_mode: k3
+  loss_mode: taid_topk
 
   # If distillation loss requires top-k logits, this is the value of k
   topk: 32
@@ -60,6 +60,13 @@ distillation_loss:
 
   # Upper bound for PPO clipping ratio.
   clip_ratio_high: 0.2
+
+  # TAID top-k schedule parameters.
+  taid_t_start: 0.4
+  taid_t_end: 1.0
+  taid_alpha: 5e-4
+  taid_beta: 0.99
+  taid_disable_adaptive: false
 
 
 # teacher model config

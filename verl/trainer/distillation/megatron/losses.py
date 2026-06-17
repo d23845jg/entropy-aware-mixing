@@ -236,6 +236,11 @@ def compute_forward_kl_topk(
     - student_mass: (bsz, seqlen/cp_size)
     - teacher_mass: (bsz, seqlen/cp_size)
     """
+    if config.distillation_loss.loss_mode == "taid_topk":
+        raise NotImplementedError(
+            "taid_topk is currently implemented only for the FSDP actor path."
+        )
+
     assert teacher_topk_log_probs.is_nested and teacher_topk_ids.is_nested
 
     # 1. split across cp groups (bsz, seqlen, topk) => (bsz, seqlen/cp_size, topk)
