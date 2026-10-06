@@ -43,25 +43,12 @@ def sft_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
         # left-shift the loss mask by one token to align with log_prob
         loss_mask_flatten = torch.roll(loss_mask_flatten, shifts=-1, dims=0)
 
-        if "eaft_weight" in model_output and model_output["eaft_weight"] is not None:
-            eaft_weight = model_output["eaft_weight"]
-            eaft_weight_flatten = eaft_weight.values() if eaft_weight.is_nested else eaft_weight
-            eaft_weight_flatten = eaft_weight_flatten.detach()
-            log_prob_flatten = log_prob_flatten * eaft_weight_flatten
-
         # NOTE: loss is averaged over all tokens in the batch across all data parallel groups,
         # For FSDP backend, the loss is directly used for backward; while for Megatron backend,
         # the loss should be scaled by `num_microbatches` for pp schedule.
         loss = -masked_sum(log_prob_flatten, loss_mask_flatten) / batch_num_tokens * dp_size
     else:
         response_mask = data["response_mask"].to(bool)
-
-        if "eaft_weight" in model_output and model_output["eaft_weight"] is not None:
-            eaft_weight = model_output["eaft_weight"]
-            if eaft_weight.dim() == 1:
-                eaft_weight = eaft_weight.unsqueeze(0)
-            eaft_weight = eaft_weight.detach()
-            log_prob = log_prob * eaft_weight
 
         loss = -masked_sum(log_prob, response_mask) / batch_num_tokens * dp_size
 

@@ -343,9 +343,6 @@ class SFTTrainer:
             "global_batch_size": self.global_batch_size,
             "pad_mode": self.config.data.pad_mode,
             "pad_token_id": self.model_config.tokenizer.pad_token_id,
-            "use_eaft_loss": self.config.use_eaft_loss,
-            "eaft_alpha": self.config.eaft_alpha,
-            "eaft_k": self.config.eaft_k,
         }
 
         train_time = 0

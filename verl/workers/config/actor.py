@@ -184,11 +184,6 @@ class ActorConfig(BaseConfig):
     global_batch_info: dict = field(default_factory=dict)
     qat: QATConfig = field(default_factory=QATConfig)
 
-    # EAFT (Entropy-Adaptive Fine-Tuning) loss parameters
-    use_eaft_loss: bool = False
-    eaft_alpha: float = 1.0  # Power parameter for adaptive weighting
-    eaft_k: int = 20  # Number of top-k tokens for entropy computation
-
     def __post_init__(self):
         """Validate actor configuration parameters."""
         assert self.strategy != MISSING

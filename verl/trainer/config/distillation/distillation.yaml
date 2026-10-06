@@ -61,6 +61,26 @@ distillation_loss:
   # Upper bound for PPO clipping ratio.
   clip_ratio_high: 0.2
 
+  # FSDP top-k alpha-mixture parameters
+  mixing_mode: "none"  # "none", "fixed", or "entropy"
+  mixture_alpha: 1.0
+  mixture_lambda: 0.1  # teacher weight used by fixed mode
+  entropy_transform: "linear"  # "linear", "sqrt", "sqrt2", "sq", or "constant"
+  entropy_top_k: null  # If null, use full vocabulary for entropy
+  # Auxiliary EOPD forward-KL parameters for OPD-style training.
+  # Set `eopd_forward_kl_coef > 0` to enable the auxiliary term.
+  # Set `eopd_forward_kl_entropy_threshold` to gate it by teacher entropy (EOPD-style).
+  eopd_forward_kl_coef: 0.0
+  eopd_forward_kl_entropy_threshold: null
+  eopd_forward_kl_teacher_entropy_source: "topk_renorm"  # "topk" or "topk_renorm"
+
+  # TAID top-k schedule parameters.
+  taid_t_start: 0.4
+  taid_t_end: 1.0
+  taid_alpha: 5e-4
+  taid_beta: 0.99
+  taid_disable_adaptive: false
+
 
 # teacher model config
 teacher_model:

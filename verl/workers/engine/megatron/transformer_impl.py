@@ -766,6 +766,9 @@ class MegatronEngineWithLMHead(MegatronEngine):
         use_fused_kernels = tu.get_non_tensor_data(batch, key="use_fused_kernels", default=False)
         calculate_entropy = tu.get_non_tensor_data(batch, key="calculate_entropy", default=False)
         distillation_use_topk = tu.get_non_tensor_data(batch, key="distillation_use_topk", default=False)
+        distillation_use_entropy_aware_pg = tu.get_non_tensor_data(
+            batch, key="distillation_use_entropy_aware_pg", default=False
+        )
         pad_mode = tu.get_non_tensor_data(batch, key="pad_mode", default=DatasetPadMode.NO_PADDING)
         temperature = batch["temperature"]
         model_inputs = self.prepare_model_inputs(batch)
@@ -813,6 +816,11 @@ class MegatronEngineWithLMHead(MegatronEngine):
                 temperature_value = float(temperature)
 
         if use_fused_kernels:
+            if distillation_use_entropy_aware_pg:
+                raise NotImplementedError(
+                    "Entropy-aware OPD policy-gradient weighting requires access to student logits "
+                    "and is not supported with fused kernels."
+                )
             fused_forward_fn = get_mcore_forward_fused_no_padding_fn(self.model_config.hf_config)
             output = fused_forward_fn(
                 model=model,
@@ -854,6 +862,14 @@ class MegatronEngineWithLMHead(MegatronEngine):
                     ret["entropy"] = entropy
                 else:
                     logits_bak = logits
+
+                if distillation_use_entropy_aware_pg:
+                    from verl.trainer.distillation.losses import _compute_entropy_aware_alpha
+
+                    ret["entropy_aware_alpha"] = _compute_entropy_aware_alpha(
+                        logits_bak.detach(),
+                        tu.get_non_tensor_data(batch, key="distillation_entropy_top_k", default=None),
+                    )
 
                 # logits_processor_func return tensors with shape (1, total_nnz/cp_size)
                 if distillation_use_topk:

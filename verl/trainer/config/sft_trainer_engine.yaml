@@ -58,11 +58,6 @@ checkpoint:
   # Mbridge config extension.
   mbridge_config: {}
 
-# EAFT (Entropy-Adaptive Fine-Tuning) loss parameters
-use_eaft_loss: False
-eaft_alpha: 1.0
-eaft_k: 20
-
 trainer:
   default_local_dir: checkpoints/${trainer.project_name}/${trainer.experiment_name}
   default_hdfs_dir: null

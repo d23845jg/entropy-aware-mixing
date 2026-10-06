@@ -1211,10 +1211,17 @@ class RayPPOTrainer:
             # step 2: convert from padding to no-padding
             batch_td = left_right_2_no_padding(batch_td)
             calculate_entropy = self.config.actor_rollout_ref.actor.entropy_coeff != 0.0
+            distillation_use_entropy_aware_topk = False
             distillation_use_topk = False
             if is_distillation_enabled(self.config.get("distillation")):
                 distillation_loss_config = self.distillation_config.distillation_loss
                 distillation_use_topk = distillation_loss_config.requires_teacher_topk_support()
+                distillation_use_entropy_aware_topk = (
+                    distillation_loss_config.requires_entropy_aware_topk_lambda()
+                )
+                distillation_entropy_top_k = distillation_loss_config.entropy_top_k
+            else:
+                distillation_entropy_top_k = None
             ppo_mini_batch_size = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
             ppo_mini_batch_size = ppo_mini_batch_size * self.config.actor_rollout_ref.rollout.n
             ppo_epochs = self.config.actor_rollout_ref.actor.ppo_epochs
@@ -1224,6 +1231,9 @@ class RayPPOTrainer:
                 batch_td,
                 calculate_entropy=calculate_entropy,
                 distillation_use_topk=distillation_use_topk,
+                distillation_use_entropy_aware_topk=distillation_use_entropy_aware_topk,
+                distillation_use_entropy_aware_pg=False,
+                distillation_entropy_top_k=distillation_entropy_top_k,
                 distillation_global_step=self.global_steps,
                 distillation_total_training_steps=self.total_training_steps,
                 global_batch_size=ppo_mini_batch_size,

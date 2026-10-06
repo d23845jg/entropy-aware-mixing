@@ -13,6 +13,8 @@
 # limitations under the License.
 
 
+from typing import Optional
+
 import torch
 
 from verl.models.mcore.util import (
@@ -222,6 +224,7 @@ def compute_forward_kl_topk(
     teacher_topk_ids: torch.Tensor,
     config: DistillationConfig,
     data_format: str,
+    entropy_aware_alpha: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Compute forward KL distillation loss using top-k log probabilities.
 
@@ -236,6 +239,13 @@ def compute_forward_kl_topk(
     - student_mass: (bsz, seqlen/cp_size)
     - teacher_mass: (bsz, seqlen/cp_size)
     """
+    if config.distillation_loss.loss_mode == "taid_topk":
+        raise NotImplementedError(
+            "taid_topk is currently implemented only for the FSDP actor path."
+        )
+    if entropy_aware_alpha is not None:
+        raise ValueError("Entropy-aware mixing is not supported for Megatron.")
+
     assert teacher_topk_log_probs.is_nested and teacher_topk_ids.is_nested
 
     # 1. split across cp groups (bsz, seqlen, topk) => (bsz, seqlen/cp_size, topk)

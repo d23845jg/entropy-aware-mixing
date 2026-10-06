@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import logging
+import math
 import os
 from dataclasses import dataclass, field
 from typing import Optional
@@ -79,6 +80,27 @@ class DistillationLossConfig(BaseConfig):
     clip_ratio_low: float = 0.2
     clip_ratio_high: float = 0.2
 
+    # FSDP top-k alpha-mixture configuration
+    mixing_mode: str = "none"  # "none", "fixed", or "entropy"
+    mixture_alpha: float = 1.0
+    mixture_lambda: float = 0.1
+    entropy_transform: str = "linear"  # "linear", "sqrt", "sqrt2", "sq", or "constant"
+    entropy_top_k: Optional[int] = None  # If None, use full vocabulary for entropy
+    # Auxiliary EOPD forward-KL configuration for OPD-style training.
+    eopd_forward_kl_coef: float = 0.0
+    eopd_forward_kl_entropy_threshold: Optional[float] = None
+    eopd_forward_kl_teacher_entropy_source: str = "topk_renorm"  # "topk" or "topk_renorm"
+
+    # TAID top-k schedule configuration.
+    taid_t_start: float = 0.4
+    taid_t_end: float = 1.0
+    taid_alpha: float = 5e-4
+    taid_beta: float = 0.99
+    taid_disable_adaptive: bool = False
+    taid_t: Optional[float] = None
+    taid_prev_loss: Optional[float] = None
+    taid_momentum: float = 0.0
+
     # Store global batch info for loss aggregation:
     # dp_size: data parallel size
     # batch_num_tokens: number of valid tokens in global batch
@@ -90,7 +112,9 @@ class DistillationLossConfig(BaseConfig):
     loss_settings: Optional[dict] = None
 
     def __post_init__(self):
-        self._mutable_fields.update({"loss_settings"})
+        self._mutable_fields.update(
+            {"loss_settings", "taid_t", "taid_prev_loss", "taid_momentum"}
+        )
         from verl.trainer.distillation.losses import (
             DistillationLossSettings,
             get_distillation_loss_settings,
@@ -114,6 +138,27 @@ class DistillationLossConfig(BaseConfig):
                 "should move) is largely unused."
             )
 
+        if self.loss_mode == "taid_topk":
+            if self.use_policy_gradient:
+                raise ValueError("taid_topk requires use_policy_gradient=False.")
+            if self.topk is None:
+                raise ValueError(
+                    "taid_topk requires distillation.topk to define the teacher support size."
+                )
+            if not 0.0 <= self.taid_t_start <= self.taid_t_end <= 1.0:
+                raise ValueError(
+                    "TAID schedule must satisfy 0 <= taid_t_start <= taid_t_end <= 1, "
+                    f"got start={self.taid_t_start}, end={self.taid_t_end}."
+                )
+            if not 0.0 <= self.taid_beta < 1.0:
+                raise ValueError(f"taid_beta must be in [0, 1), got {self.taid_beta}.")
+            if self.taid_alpha < 0.0:
+                raise ValueError(
+                    f"taid_alpha must be non-negative, got {self.taid_alpha}."
+                )
+            if self.taid_t is None:
+                self.taid_t = self.taid_t_start
+
         if not self.use_policy_gradient and self.loss_mode in ("kl", "k1"):
             raise ValueError(
                 "Directly backpropagating kl/k1 loss is incorrect since its gradient wrt model weights "
@@ -131,13 +176,92 @@ class DistillationLossConfig(BaseConfig):
                     f"but got topk={self.topk} and teacher_topk={self.teacher_topk}."
                 )
 
+        if (
+            self.eopd_forward_kl_entropy_threshold is not None
+            and self.eopd_forward_kl_coef <= 0
+        ):
+            raise ValueError(
+                "eopd_forward_kl_entropy_threshold requires eopd_forward_kl_coef > 0."
+            )
+
+        if self.mixing_mode not in ("none", "fixed", "entropy"):
+            raise ValueError(
+                "mixing_mode must be one of {'none', 'fixed', 'entropy'}, "
+                f"got {self.mixing_mode}."
+            )
+        if not math.isfinite(self.mixture_alpha):
+            raise ValueError(
+                f"mixture_alpha must be finite, got {self.mixture_alpha}."
+            )
+        if not 0.0 <= self.mixture_lambda <= 1.0:
+            raise ValueError(
+                f"mixture_lambda must be in [0, 1], got {self.mixture_lambda}."
+            )
+        if self.entropy_transform not in (
+            "linear",
+            "sqrt",
+            "sqrt2",
+            "sq",
+            "constant",
+        ):
+            raise ValueError(
+                "entropy_transform must be one of "
+                "{'linear', 'sqrt', 'sqrt2', 'sq', 'constant'}, "
+                f"got {self.entropy_transform}."
+            )
+        if self.mixing_mode != "none":
+            if self.loss_mode != "forward_kl_topk":
+                raise ValueError(
+                    "FSDP alpha-mixture distillation requires "
+                    "loss_mode='forward_kl_topk'."
+                )
+            if self.use_policy_gradient:
+                raise ValueError(
+                    "FSDP alpha-mixture distillation requires "
+                    "use_policy_gradient=False."
+                )
+
+        if (
+            self.loss_mode in ("forward_kl_topk", "taid_topk")
+            or self.eopd_forward_kl_coef > 0
+        ):
+            if self.eopd_forward_kl_teacher_entropy_source not in (
+                "topk",
+                "topk_renorm",
+            ):
+                raise ValueError(
+                    "eopd_forward_kl_teacher_entropy_source must be one of {'topk', 'topk_renorm'}, "
+                    f"got {self.eopd_forward_kl_teacher_entropy_source}."
+                )
+
+        if self.eopd_forward_kl_coef > 0:
+            if not self.use_policy_gradient:
+                raise ValueError(
+                    "Auxiliary EOPD forward-KL is only supported on top of the policy-gradient OPD path."
+                )
+            if not self.loss_settings.use_estimator:
+                raise ValueError(
+                    "Auxiliary EOPD forward-KL currently augments estimator-mode distillation losses such as k1."
+                )
+            if self.topk is None:
+                raise ValueError(
+                    "Auxiliary EOPD forward-KL requires distillation.topk to define the teacher support size."
+                )
+
     def requires_teacher_topk_support(self) -> bool:
-        return self.loss_settings.use_topk or self.teacher_topk is not None
+        return (
+            self.loss_settings.use_topk
+            or self.eopd_forward_kl_coef > 0
+            or self.teacher_topk is not None
+        )
 
     def get_teacher_support_topk(self) -> Optional[int]:
         if not self.requires_teacher_topk_support():
             return None
         return self.teacher_topk if self.teacher_topk is not None else self.topk
+
+    def requires_entropy_aware_topk_lambda(self) -> bool:
+        return self.mixing_mode == "entropy"
 
 
 @dataclass

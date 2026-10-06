@@ -17,7 +17,6 @@ The concrete Engine implementation using PyTorch FullyShardedDataParallel (FSDP)
 
 import gc
 import logging
-import math
 import os
 import warnings
 from contextlib import nullcontext
@@ -604,29 +603,6 @@ class FSDPEngine(BaseEngine):
         # postprocess and return
         return postprocess_batch_func(output_lst=output_lst, indices=indices, data=data)
 
-    def _compute_eaft_weight_from_logits(self, logits: torch.Tensor, k: int = 20, alpha: float = 1.0) -> torch.Tensor:
-        if hasattr(logits, "is_nested") and logits.is_nested:
-            logits_flat = logits.values()
-        else:
-            logits_flat = logits.view(-1, logits.shape[-1]) if logits.dim() > 2 else logits
-
-        topk_val, _ = torch.topk(logits_flat, k=min(k, logits_flat.shape[-1]), dim=-1)
-        log_probs_topk = topk_val - torch.logsumexp(topk_val, dim=-1, keepdim=True)
-        probs_topk = torch.exp(log_probs_topk)
-        entropy_topk = -(probs_topk * log_probs_topk).sum(dim=-1)
-
-        max_entropy = torch.log(
-            torch.tensor(min(k, logits_flat.shape[-1]), dtype=logits_flat.dtype, device=logits_flat.device)
-        )
-        adaptive_weight = torch.pow(entropy_topk / max_entropy, alpha)
-
-        if hasattr(logits, "is_nested") and logits.is_nested:
-            adaptive_weight = torch.nested.nested_tensor_from_jagged(adaptive_weight, logits.offsets())
-        elif logits.dim() > 2:
-            adaptive_weight = adaptive_weight.view(*logits.shape[:-1])
-
-        return adaptive_weight
-
     def forward_step(self, micro_batch: TensorDict, loss_function, forward_only):
         raise NotImplementedError("forward_step must be implemented in subclass")
 
@@ -1026,10 +1002,10 @@ class FSDPEngineWithLMHead(FSDPEngine):
         pad_mode = tu.get_non_tensor_data(data=micro_batch, key="pad_mode", default=DatasetPadMode.NO_PADDING)
         use_fused_kernels = tu.get_non_tensor_data(data=micro_batch, key="use_fused_kernels", default=False)
         calculate_entropy = tu.get_non_tensor_data(data=micro_batch, key="calculate_entropy", default=False)
-        use_eaft_loss = tu.get_non_tensor_data(data=micro_batch, key="use_eaft_loss", default=False)
-        eaft_alpha = tu.get_non_tensor_data(data=micro_batch, key="eaft_alpha", default=1.0)
-        eaft_k = tu.get_non_tensor_data(data=micro_batch, key="eaft_k", default=20)
         distillation_use_topk = tu.get_non_tensor_data(data=micro_batch, key="distillation_use_topk", default=False)
+        distillation_use_entropy_aware_topk = tu.get_non_tensor_data(
+            data=micro_batch, key="distillation_use_entropy_aware_topk", default=False
+        )
 
         model_output = {}
 
@@ -1043,31 +1019,27 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 # temperature is singleton
                 log_probs = output.log_probs.squeeze(0)  # (total_nnz,)
                 entropy_rmpad = output.entropy.squeeze(0)  # (total_nnz,)
-                if use_eaft_loss:
-                    vocab_size = getattr(getattr(self.module, "config", None), "vocab_size", None)
-                    assert vocab_size is not None, (
-                        "Could not retrieve vocab_size from model config; "
-                        "required for EAFT entropy normalization in fused kernel mode."
+                if distillation_use_entropy_aware_topk:
+                    raise NotImplementedError(
+                        "Entropy-aware distillation requires access to student logits and is not supported with "
+                        "fused kernels."
                     )
-                    max_entropy = math.log(vocab_size)
-                    with torch.no_grad():
-                        eaft_weight_rmpad = torch.pow(
-                            (entropy_rmpad / max_entropy).clamp(min=0.0, max=1.0), eaft_alpha
-                        )
             else:
                 logits_rmpad = output.logits.squeeze(0)  # (total_nnz, vocab_size)
                 logits_rmpad.div_(temperature_rmpad.clamp(min=1e-8).unsqueeze(-1).to(logits_rmpad.dtype))
-                if use_eaft_loss:
-                    with torch.no_grad():
-                        eaft_weight_rmpad = self._compute_eaft_weight_from_logits(logits_rmpad, eaft_k, eaft_alpha)
+                if distillation_use_entropy_aware_topk:
+                    from verl.trainer.distillation.losses import _compute_entropy_aware_alpha
+
+                    entropy_aware_lambda_rmpad = _compute_entropy_aware_alpha(
+                        logits_rmpad.detach(),
+                        tu.get_non_tensor_data(data=micro_batch, key="distillation_entropy_top_k", default=None),
+                    )
+
                 # if use_sp: ((total_nnz / sp) + pad) ; if not use_sp: (batch, seqlen)
-                inplace_backward = True
-                if calculate_entropy or use_eaft_loss:
-                    inplace_backward = False
                 log_probs = logprobs_from_logits(
                     logits=logits_rmpad,
                     labels=input_ids_rmpad_rolled,
-                    inplace_backward=inplace_backward,
+                    inplace_backward=not calculate_entropy,
                 )
 
                 # compute entropy
@@ -1085,6 +1057,8 @@ class FSDPEngineWithLMHead(FSDPEngine):
                         "student_logits": logits_rmpad.unsqueeze(0),
                         "data": micro_batch,
                     }
+                    if distillation_use_entropy_aware_topk:
+                        logits_processor_kwargs["entropy_aware_lambda"] = entropy_aware_lambda_rmpad.unsqueeze(0)
                     outputs = logits_processor_func(**logits_processor_kwargs)
                     cu_seqlens = input_ids.offsets()
                     for k, v in outputs.items():
@@ -1113,22 +1087,12 @@ class FSDPEngineWithLMHead(FSDPEngine):
                         unpad_dim=0,
                         padding_size=pad_size,
                     )
-                if use_eaft_loss:
-                    eaft_weight_rmpad = gather_outputs_and_unpad(
-                        eaft_weight_rmpad,
-                        gather_dim=0,
-                        unpad_dim=0,
-                        padding_size=pad_size,
-                    )
-
             if pad_mode == DatasetPadMode.NO_PADDING:
                 cu_seqlens = input_ids.offsets()
                 # (bsz, j1), for each sample, is the length of each sample: [real_prompt length + real_response length]
                 log_probs = torch.nested.nested_tensor_from_jagged(log_probs, cu_seqlens)
                 if calculate_entropy:
                     entropy = torch.nested.nested_tensor_from_jagged(entropy_rmpad, cu_seqlens)
-                if use_eaft_loss:
-                    eaft_weight = torch.nested.nested_tensor_from_jagged(eaft_weight_rmpad, cu_seqlens)
             else:
                 raise NotImplementedError(f"pad_mode {pad_mode} not implemented")
 
@@ -1137,21 +1101,25 @@ class FSDPEngineWithLMHead(FSDPEngine):
             if use_fused_kernels:
                 log_probs = output.log_probs[:, -response_length - 1 : -1]
                 entropy = output.entropy[:, -response_length - 1 : -1]  # (bsz, response_length)
-                if use_eaft_loss:
-                    vocab_size = getattr(getattr(self.module, "config", None), "vocab_size", None)
-                    assert vocab_size is not None, (
-                        "Could not retrieve vocab_size from model config; "
-                        "required for EAFT entropy normalization in fused kernel mode."
+                if distillation_use_entropy_aware_topk:
+                    raise NotImplementedError(
+                        "Entropy-aware distillation requires access to student logits and is not supported with "
+                        "fused kernels."
                     )
-                    max_entropy = math.log(vocab_size)
-                    with torch.no_grad():
-                        eaft_weight = torch.pow((entropy / max_entropy).clamp(min=0.0, max=1.0), eaft_alpha)
 
             else:
                 logits = output.logits  # (bsz, response_length, vocab_size)
                 temperature = output_args["temperature"]  # (bsz,)
                 temperature = temperature.unsqueeze(-1).unsqueeze(-1)
                 logits.div_(temperature.clamp(min=1e-8).to(logits.dtype))
+                if distillation_use_entropy_aware_topk:
+                    from verl.trainer.distillation.losses import _compute_entropy_aware_alpha
+
+                    entropy_aware_lambda = _compute_entropy_aware_alpha(
+                        logits.detach(),
+                        tu.get_non_tensor_data(data=micro_batch, key="distillation_entropy_top_k", default=None),
+                    )
+
                 if calculate_entropy:
                     if not self.engine_config.entropy_checkpointing:
                         entropy = verl_F.entropy_from_logits(logits)
@@ -1165,28 +1133,25 @@ class FSDPEngineWithLMHead(FSDPEngine):
                     logits = torch.nested.narrow(logits, 1, starts, seq_lengths, layout=torch.jagged)
                     logits_rmpad = torch.cat([t for t in logits.unbind()])
                     input_ids_rmpad_rolled = output_args["input_ids_rmpad_rolled"]
-                    inplace_backward = not use_eaft_loss
                     log_probs = logprobs_from_logits(
                         logits=logits_rmpad,
                         labels=input_ids_rmpad_rolled,
-                        inplace_backward=inplace_backward,
+                        inplace_backward=True,
                     )
                     # (bsz, j1), for each sample, length of each sample: [real_prompt_length + real_response_length]
                     log_probs = torch.nested.nested_tensor_from_jagged(log_probs, cu_seqlens)
-                    if use_eaft_loss:
-                        with torch.no_grad():
-                            eaft_weight = self._compute_eaft_weight_from_logits(logits_rmpad, eaft_k, eaft_alpha)
-                            eaft_weight = torch.nested.nested_tensor_from_jagged(eaft_weight, cu_seqlens)
                     if calculate_entropy:
                         entropy = torch.nested.narrow(entropy, 1, starts, seq_lengths, layout=torch.jagged)
                         entropy_rmpad = torch.cat([t for t in entropy.unbind()])
                         entropy = torch.nested.nested_tensor_from_jagged(entropy_rmpad, cu_seqlens)
+                    if distillation_use_entropy_aware_topk:
+                        entropy_aware_lambda = torch.nested.narrow(
+                            entropy_aware_lambda, 1, starts, seq_lengths, layout=torch.jagged
+                        )
                 else:
                     raise NotImplementedError(f"pad_mode {pad_mode} not implemented")
 
         model_output["log_probs"] = log_probs
-        if use_eaft_loss:
-            model_output["eaft_weight"] = eaft_weight
         if calculate_entropy:
             model_output["entropy"] = entropy
 

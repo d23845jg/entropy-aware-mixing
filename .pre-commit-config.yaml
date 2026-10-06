@@ -1,0 +1,41 @@
+default_language_version:
+  python: python3.12
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: check-added-large-files
+        args: [--maxkb=10240]
+      - id: check-symlinks
+      - id: destroyed-symlinks
+      - id: trailing-whitespace
+        args: ["--markdown-linebreak-ext=md,markdown,mdx"]
+      - id: end-of-file-fixer
+      - id: mixed-line-ending
+        args: [--fix=lf]
+      - id: check-yaml
+      - id: check-toml
+      - id: check-json
+      - id: check-merge-conflict
+      - id: check-shebang-scripts-are-executable
+      - id: detect-private-key
+      - id: debug-statements
+      - id: check-case-conflict
+
+  # Ruff replaces both black and isort — faster and config-compatible
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.9.10
+    hooks:
+      - id: ruff              # lint + auto-fix (replaces flake8, isort, pyupgrade, …)
+        args: [--fix]
+      - id: ruff-format       # format (black-compatible)
+      - id: ruff-format
+        name: ruff-format-notebooks
+        types: [jupyter]
+
+  - repo: https://github.com/codespell-project/codespell
+    rev: v2.4.1
+    hooks:
+      - id: codespell
+        args: [--skip=*.ipynb,--write-changes]

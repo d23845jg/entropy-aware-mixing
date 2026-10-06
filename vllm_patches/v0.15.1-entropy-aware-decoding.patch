@@ -1,0 +1,567 @@
+--- a/vllm/config/speculative.py
++++ b/vllm/config/speculative.py
+@@ -109,6 +109,19 @@
+     which may only be supported by certain attention backends. This currently
+     only affects the EAGLE method of speculation."""
+ 
++    # Entropy-aware rejection sampler configuration.
++    use_entropy_aware_mixing: bool = False
++    """Enable entropy-aware speculative decoding in the rejection sampler.
++    When enabled, target probabilities are replaced by an entropy-conditioned
++    blend before rejection sampling."""
++    entropy_top_k: int = Field(default=50, ge=1)
++    """Top-k size used for draft entropy approximation when
++    use_entropy_aware_mixing is enabled."""
++    entropy_aware_mixing: Literal["geometric", "convex"] = "geometric"
++    """Blend type for combining draft and target distributions."""
++    entropy_aware_alpha: Literal["linear", "sqrt", "sqrt2", "sq", "constant"] = "linear"
++    """Alpha-shaping mode used by the entropy-aware distribution blend."""
++
+     # Ngram proposer configuration
+     prompt_lookup_max: int | None = Field(default=None, ge=1)
+     """Maximum size of ngram token window when using Ngram proposer, required
+--- a/vllm/v1/sample/rejection_sampler.py
++++ b/vllm/v1/sample/rejection_sampler.py
+@@ -1,11 +1,13 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
++import math
+ from collections.abc import Sequence
+ from dataclasses import replace
+ 
+ import torch
+ import torch.nn as nn
++import torch.nn.functional as F
+ 
+ from vllm.logger import init_logger
+ from vllm.triton_utils import tl, triton
+@@ -13,7 +15,7 @@
+ from vllm.v1.sample.metadata import SamplingMetadata
+ from vllm.v1.sample.ops.bad_words import apply_bad_words_with_drafts
+ from vllm.v1.sample.ops.penalties import apply_all_penalties
+-from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
++from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p, apply_top_k_only
+ from vllm.v1.sample.sampler import Sampler
+ from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
+ 
+@@ -49,18 +51,38 @@
+         output tokens = accepted tokens + recovered tokens + bonus tokens
+     """
+ 
+-    def __init__(self, sampler: Sampler):
++    def __init__(
++        self,
++        sampler: Sampler,
++        use_entropy_aware_mixing: bool = False,
++        entropy_top_k: int = 20,
++        entropy_aware_mixing: str = "geometric",
++        entropy_aware_alpha: str = "linear",
++    ):
+         super().__init__()
+         self.sampler = sampler
++        self.use_entropy_aware_mixing = use_entropy_aware_mixing
++        self.entropy_top_k = entropy_top_k
++        self.entropy_aware_mixing = entropy_aware_mixing
++        self.entropy_aware_alpha = entropy_aware_alpha
+         logprobs_mode = self.sampler.logprobs_mode
+         self.is_processed_logprobs_mode = logprobs_mode.startswith("processed")
+         self.is_logits_logprobs_mode = logprobs_mode.endswith("logits")
++        if self.use_entropy_aware_mixing:
++            logger.info(
++                "Entropy-Aware Speculative Decoding enabled "
++                "(entropy_top_k=%d, entropy_aware_mixing=%s, "
++                "entropy_aware_alpha=%s)",
++                self.entropy_top_k,
++                self.entropy_aware_mixing,
++                self.entropy_aware_alpha,
++            )
+ 
+     def forward(
+         self,
+         metadata: SpecDecodeMetadata,
+         # [num_tokens, vocab_size]
+-        draft_probs: torch.Tensor | None,
++        draft_logits: torch.Tensor | None,
+         # [num_tokens + batch_size, vocab_size]
+         logits: torch.Tensor,
+         sampling_metadata: SamplingMetadata,
+@@ -69,10 +91,10 @@
+         Args:
+             metadata:
+                 Metadata for spec decoding.
+-            draft_probs (Optional[torch.Tensor]):
+-                Probability distribution for the draft tokens. Shape is
+-                [num_tokens, vocab_size]. Can be None if probabilities are
+-                not provided, which is the case for ngram spec decode.
++            draft_logits (Optional[torch.Tensor]):
++                Draft-model logits for the draft tokens with shape
++                [num_tokens, vocab_size]. Can be None for paths without
++                draft-model logits (e.g., ngram spec decode).
+             logits (torch.Tensor):
+                 Target model's logits probability distribution.
+                 Shape is [num_tokens + batch_size, vocab_size]. Here,
+@@ -97,37 +119,65 @@
+         # logits tensor. This means any in-place operations on bonus_logits
+         # won't affect the original logits tensor.
+         assert logits is not None
+-        bonus_logits = logits[bonus_logits_indices]
+-        bonus_sampler_output = self.sampler(
+-            logits=bonus_logits,
+-            sampling_metadata=replace(
+-                sampling_metadata,
+-                max_num_logprobs=-1,
+-            ),
+-            predict_bonus_token=True,
+-            # Override the logprobs mode to return logits because they are
+-            # needed later to compute the accepted token logprobs.
+-            logprobs_mode_override="processed_logits"
+-            if self.is_processed_logprobs_mode
+-            else "raw_logits",
+-        )
+-        bonus_token_ids = bonus_sampler_output.sampled_token_ids
+ 
+         # Just like `bonus_logits`, `target_logits` is a new tensor with
+         # separate storage from the original `logits` tensor. Therefore,
+         # it is safe to update `target_logits` in place.
+         raw_target_logits = logits[target_logits_indices]
+-        # Use float32 for the target_logits.
+-        raw_target_logits = raw_target_logits.to(torch.float32)
+         target_logits = raw_target_logits
++        
++        if self.use_entropy_aware_mixing and draft_logits is not None:
++            # Compute target mixture
++            alpha = self._compute_entropy_alpha(
++                draft_logits, self.entropy_top_k
++            )
++            target_logits = self._compute_entropy_mixture(
++                target_logits,
++                draft_logits,
++                alpha,
++                self.entropy_aware_mixing,
++                self.entropy_aware_alpha,
++            )
++
++            bonus_token_ids = torch.full(
++                (len(metadata.num_draft_tokens),),
++                PLACEHOLDER_TOKEN_ID,
++                dtype=torch.int32,
++                device=logits.device,
++            )
++            bonus_logits_for_logprobs = torch.zeros(
++                (len(metadata.num_draft_tokens), logits.shape[-1]),
++                dtype=torch.float32,
++                device=logits.device,
++            )      
++        else:
++            bonus_logits = logits[bonus_logits_indices]
++            bonus_sampler_output = self.sampler(
++                logits=bonus_logits,
++                sampling_metadata=replace(
++                    sampling_metadata,
++                    max_num_logprobs=-1,
++                ),
++                predict_bonus_token=True,
++                # Override the logprobs mode to return logits because they are
++                # needed later to compute the accepted token logprobs.
++                logprobs_mode_override="processed_logits"
++                if self.is_processed_logprobs_mode
++                else "raw_logits",
++            )
++            bonus_token_ids = bonus_sampler_output.sampled_token_ids
++            bonus_logits_for_logprobs = bonus_sampler_output.logprobs_tensors.logprobs
++        
++        draft_probs = None
++        
+         if not self.is_processed_logprobs_mode:
+-            # Clone raw_target_logits before applying processors to preserve
+-            # the original raw logits for logprobs computation, since
+-            # apply_logits_processors modifies the tensor in-place.
+-            target_logits = target_logits.clone()
++            if target_logits.data_ptr() == raw_target_logits.data_ptr():
++                target_logits = target_logits.clone()
++        
+         target_logits = self.apply_logits_processors(
+             target_logits, sampling_metadata, metadata
+         )
++        
+         # [num_tokens, vocab_size]
+         # NOTE(woosuk): `target_logits` can be updated in place inside the
+         # `apply_sampling_constraints` function.
+@@ -136,9 +186,10 @@
+             metadata.cu_num_draft_tokens,
+             sampling_metadata,
+         )
++
+         # Compute probability distribution from target logits.
+         target_probs = target_logits.softmax(dim=-1, dtype=torch.float32)
+-
++        
+         output_token_ids = rejection_sample(
+             metadata.draft_token_ids,
+             metadata.num_draft_tokens,
+@@ -157,7 +208,7 @@
+                 metadata,
+                 logits,
+                 target_logits if self.is_processed_logprobs_mode else raw_target_logits,
+-                bonus_sampler_output.logprobs_tensors.logprobs,
++                bonus_logits_for_logprobs,
+                 output_token_ids,
+             )
+ 
+@@ -323,7 +374,62 @@
+             output_token_ids,
+         )
+         return logits
++
++    @staticmethod
++    def _compute_entropy_alpha(
++        draft_logits: torch.Tensor,  # [num_tokens, vocab_size]
++        entropy_top_k: int = 50,
++    ) -> torch.Tensor:
++        top_k = min(entropy_top_k, draft_logits.shape[-1])
++        if top_k <= 1:
++            return torch.zeros_like(draft_logits[..., 0], dtype=torch.float32)
++        top_k_logits = torch.topk(draft_logits, top_k, dim=-1, sorted=False).values
++        top_k_log_probs = top_k_logits - torch.logsumexp(top_k_logits, dim=-1, keepdim=True)
++        top_k_probs = top_k_log_probs.exp()
++        entropy_approx = -(top_k_probs * top_k_log_probs).sum(dim=-1)
++        return (entropy_approx / math.log(entropy_top_k)).clamp_(0.0, 1.0)
++
++    @staticmethod
++    def _compute_entropy_mixture(
++        target_logits: torch.Tensor,
++        draft_logits: torch.Tensor,
++        alpha: torch.Tensor,
++        entropy_aware_mixing: str = "geometric",
++        entropy_aware_alpha: str = "linear",
++    ) -> torch.Tensor:
++        alpha_expanded = alpha.unsqueeze(-1)
++
++        if entropy_aware_alpha == "sqrt":
++            alpha_expanded = torch.sqrt(alpha_expanded)
++        elif entropy_aware_alpha == "sqrt2":
++            alpha_expanded = torch.sqrt(torch.sqrt(alpha_expanded))
++        elif entropy_aware_alpha == "sq":
++            alpha_expanded = alpha_expanded.square()
++        elif entropy_aware_alpha == "constant":
++            alpha_expanded = torch.full_like(alpha_expanded, 0.1)
++        elif entropy_aware_alpha == "linear":
++            pass
++        else:
++            raise ValueError(f"Unsupported entropy_aware_alpha: {entropy_aware_alpha}")
++
++        if entropy_aware_mixing == "geometric":
++            return torch.lerp(draft_logits, target_logits, alpha_expanded)
++        elif entropy_aware_mixing == "convex":
++            log_alpha = torch.log(alpha_expanded)
++            log_one_minus_alpha = torch.log1p(-alpha_expanded)
+ 
++            mixed = F.log_softmax(target_logits, dim=-1)
++            mixed.add_(log_alpha)
++
++            draft_term = F.log_softmax(draft_logits, dim=-1)
++            draft_term.add_(log_one_minus_alpha)
++
++            return torch.logaddexp(mixed, draft_term)
++        raise ValueError(
++            f"Unsupported entropy_aware_mixing: {entropy_aware_mixing}"
++        )
++
++
+     @staticmethod
+     def _combine_outputs_with_spec_tokens(
+         output_token_ids: list[list[int]],
+@@ -474,9 +576,6 @@
+         replace_from=GREEDY_TEMPERATURE,
+         replace_to=1,
+     )
+-    # NOTE(woosuk): Update `logits` in place to avoid allocating a new tensor.
+-    logits.div_(temperature.unsqueeze(-1))
+-
+     # Get expanded top_k and top_p tensors.
+     top_k = None
+     if sampling_metadata.top_k is not None:
+@@ -493,11 +592,38 @@
+             num_tokens,
+         )
+ 
+-    # NOTE(woosuk): `apply_top_k_top_p` uses sorting to calculate the mask,
+-    # which is slow for large vocab sizes. This may cause performance issues.
+-    return apply_top_k_top_p(logits, top_k, top_p)
++    if top_p is None:
++        logits = logits.to(dtype=torch.float32)
++        logits.div_(temperature.unsqueeze(-1))
++        if top_k is None:
++            return logits
++        return apply_top_k_only(logits, top_k)
++    
++    logits_sort, logits_idx = logits.sort(dim=-1, descending=False)
+ 
++    logits_sort = logits_sort.to(dtype=torch.float32)
++    logits_sort.div_(temperature.unsqueeze(-1))
+ 
++    if top_k is not None:
++        # Apply top-k using positional masking.
++        vocab_size = logits_sort.size(-1)
++        pos = torch.arange(vocab_size, device=logits_sort.device)
++        top_k_thresholds = vocab_size - top_k.unsqueeze(-1)
++        logits_sort.masked_fill_(pos < top_k_thresholds, -float("inf"))
++
++    # Apply top-p.
++    probs_sort = logits_sort.softmax(dim=-1)
++    torch.cumsum(probs_sort, dim=-1, out=probs_sort)
++    top_p_mask = probs_sort <= 1 - top_p.unsqueeze(dim=1)
++
++    top_p_mask[:, -1] = False
++    logits_sort.masked_fill_(top_p_mask, -float("inf"))
++
++    out_logits = torch.empty_like(logits_sort)
++    out_logits.scatter_(dim=-1, index=logits_idx, src=logits_sort)
++    return out_logits
++
++
+ def expand_batch_to_tokens(
+     x: torch.Tensor,  # [batch_size]
+     cu_num_tokens: torch.Tensor,  # [batch_size]
+--- a/vllm/v1/spec_decode/draft_model.py
++++ b/vllm/v1/spec_decode/draft_model.py
+@@ -252,7 +252,8 @@
+     start_loc = tl.load(query_start_locs_ptr + pid)
+     is_last_program = pid == tl.num_programs(0) - 1
+     if is_last_program:
+-        next_start_loc = target_toks_size.to(tl.int32)
++        # next_start_loc = target_toks_size.to(tl.int32)
++        next_start_loc = tl.full((), target_toks_size, tl.int32)
+     else:
+         next_start_loc = tl.load(query_start_locs_ptr + pid + 1).to(tl.int32)
+ 
+--- a/vllm/v1/spec_decode/eagle.py
++++ b/vllm/v1/spec_decode/eagle.py
+@@ -287,7 +287,7 @@
+         slot_mappings: dict[str, torch.Tensor]
+         | list[dict[str, torch.Tensor]]
+         | None = None,
+-    ) -> torch.Tensor:
++    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+         batch_size = common_attn_metadata.batch_size()
+ 
+         if self.method == "eagle3":
+@@ -400,7 +400,7 @@
+         # Early exit if there is only one draft token to be generated.
+         if self.num_speculative_tokens == 1:
+             draft_token_ids = logits.argmax(dim=-1)
+-            return draft_token_ids.view(-1, 1)
++            return draft_token_ids.view(-1, 1), logits.unsqueeze(1)
+ 
+         if self.uses_mrope:
+             positions = self.positions[:, last_token_indices]
+@@ -427,7 +427,8 @@
+                 slot_mappings=slot_mappings,
+             )
+             # [batch_size, num_tree_tokens]
+-            return torch.cat(draft_token_ids_list, dim=1)
++            # Tree path currently returns token ids only.
++            return torch.cat(draft_token_ids_list, dim=1), None
+ 
+         draft_token_ids = logits.argmax(dim=-1)
+ 
+@@ -443,6 +444,7 @@
+ 
+         # Generate the remaining draft tokens.
+         draft_token_ids_list = [draft_token_ids]
++        draft_logits_list = [logits]
+ 
+         batch_size_dp_padded, batch_size_across_dp = self._pad_batch_across_dp(
+             num_tokens_unpadded=batch_size, num_tokens_padded=batch_size
+@@ -597,10 +599,13 @@
+             logits = self.model.compute_logits(last_hidden_states[:batch_size])
+             draft_token_ids = logits.argmax(dim=-1)
+             draft_token_ids_list.append(draft_token_ids)
++            draft_logits_list.append(logits)
+ 
+         # [batch_size, num_speculative_tokens]
+         draft_token_ids = torch.stack(draft_token_ids_list, dim=1)
+-        return draft_token_ids
++        # [batch_size, num_speculative_tokens, vocab_size]
++        draft_logits = torch.stack(draft_logits_list, dim=1)
++        return draft_token_ids, draft_logits
+ 
+     def set_inputs_first_pass(
+         self,
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -470,7 +470,13 @@
+                     "Unknown speculative decoding method: "
+                     f"{self.speculative_config.method}"
+                 )
+-            self.rejection_sampler = RejectionSampler(self.sampler)
++            self.rejection_sampler = RejectionSampler(
++                self.sampler,
++                use_entropy_aware_mixing=self.speculative_config.use_entropy_aware_mixing,
++                entropy_top_k=self.speculative_config.entropy_top_k,
++                entropy_aware_mixing=self.speculative_config.entropy_aware_mixing,
++                entropy_aware_alpha=self.speculative_config.entropy_aware_alpha,
++            )
+ 
+         self.num_spec_tokens = 0
+         if self.speculative_config:
+@@ -658,6 +664,9 @@
+ 
+         # Cached outputs.
+         self._draft_token_ids: list[list[int]] | torch.Tensor | None = None
++        # [num_reqs, num_spec_tokens, vocab_size] for previous step proposals.
++        self._draft_logits: torch.Tensor | None = None
++        self._draft_logits_peak_bytes = 0
+         self._draft_token_req_ids: list[str] | None = None
+         self.transfer_event = torch.Event()
+         self.sampled_token_ids_pinned_cpu = torch.empty(
+@@ -2836,14 +2845,64 @@
+             draft_token_ids_cpu, _ = self._get_draft_token_ids_cpu()
+             self.input_batch.update_async_spec_token_ids(draft_token_ids_cpu)
+ 
++        draft_logits = self._build_draft_logits_for_current_step(spec_decode_metadata)
+         sampler_output = self.rejection_sampler(
+-            spec_decode_metadata,
+-            None,  # draft_probs
+-            logits,
+-            sampling_metadata,
++            metadata=spec_decode_metadata,
++            draft_logits=draft_logits,
++            logits=logits,
++            sampling_metadata=sampling_metadata,
+         )
+         return sampler_output
++
++    def _build_draft_logits_for_current_step(
++        self,
++        spec_decode_metadata: SpecDecodeMetadata,
++    ) -> torch.Tensor | None:
++        """Align cached draft logits to current request order and flatten.
+ 
++        Returns [sum(num_draft_tokens), vocab_size] or None when unavailable.
++        """
++        if self._draft_logits is None or self._draft_token_req_ids is None:
++            return None
++
++        if self._draft_logits.ndim != 3:
++            return None
++
++        req_to_prev_idx = {
++            req_id: i for i, req_id in enumerate(self._draft_token_req_ids)
++        }
++        cur_req_ids = self.input_batch.req_ids
++
++        expected_prev_reqs = len(self._draft_token_req_ids)
++        if self._draft_logits.shape[0] != expected_prev_reqs:
++            return None
++
++        if len(spec_decode_metadata.num_draft_tokens) != len(cur_req_ids):
++            return None
++
++        max_cached_steps = self._draft_logits.shape[1]
++
++        rows: list[torch.Tensor] = []
++        for cur_idx, req_id in enumerate(cur_req_ids):
++            n = int(spec_decode_metadata.num_draft_tokens[cur_idx])
++            if n <= 0:
++                continue
++            if n > max_cached_steps:
++                return None
++            prev_idx = req_to_prev_idx.get(req_id)
++            if prev_idx is None:
++                return None
++            rows.append(self._draft_logits[prev_idx, :n, :])
++
++        if not rows:
++            return None
++
++        draft_logits = torch.cat(rows, dim=0).contiguous()
++        expected_num_draft = spec_decode_metadata.draft_token_ids.shape[0]
++        if draft_logits.shape[0] != expected_num_draft:
++            return None
++        return draft_logits
++
+     def _bookkeeping_sync(
+         self,
+         scheduler_output: "SchedulerOutput",
+@@ -3630,6 +3689,7 @@
+         )
+ 
+         self._draft_token_ids = None
++        self._draft_logits = None
+         self._draft_token_req_ids = None
+         self.input_batch.prev_sampled_token_ids = None
+ 
+@@ -3647,6 +3707,8 @@
+                     spec_decode_common_attn_metadata,
+                     slot_mappings,
+                 )
++                # Request order for draft caches is the current input batch order.
++                self._draft_token_req_ids = self.input_batch.req_ids.copy()
+                 self._copy_draft_token_ids_to_cpu(scheduler_output)
+ 
+         spec_config = self.speculative_config
+@@ -3685,6 +3747,7 @@
+                     self._draft_token_ids = torch.zeros(
+                         1, device=self.device, dtype=torch.int32
+                     ).expand(len(self.input_batch.req_ids), self.num_spec_tokens)
++                    self._draft_logits = None
+                     self._copy_draft_token_ids_to_cpu(scheduler_output, zeros_only=True)
+             else:
+                 propose_drafts_after_bookkeeping = input_fits_in_drafter
+@@ -3856,6 +3919,7 @@
+         common_attn_metadata: CommonAttentionMetadata,
+         slot_mappings: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None,
+     ) -> list[list[int]] | torch.Tensor:
++        self._draft_logits = None
+         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+         spec_config = self.speculative_config
+         assert spec_config is not None
+@@ -3999,7 +4063,7 @@
+             else:
+                 mm_embed_inputs = None
+ 
+-            draft_token_ids = self.drafter.propose(
++            draft_out = self.drafter.propose(
+                 target_token_ids=target_token_ids,
+                 target_positions=target_positions,
+                 target_hidden_states=target_hidden_states,
+@@ -4011,6 +4075,11 @@
+                 num_rejected_tokens_gpu=num_rejected_tokens_gpu,
+                 slot_mappings=slot_mappings,
+             )
++            if isinstance(draft_out, tuple):
++                draft_token_ids, draft_logits = draft_out
++                self._draft_logits = draft_logits
++            else:
++                draft_token_ids = draft_out
+ 
+         return draft_token_ids
+ 
+@@ -4829,10 +4898,6 @@
+             )
+ 
+             num_tokens = sum(len(ids) for ids in draft_token_ids)
+-            # draft_probs = torch.randn(
+-            #     num_tokens, logits.shape[-1], device=self.device,
+-            #     dtype=logits.dtype)
+-            draft_probs = None
+             logits = torch.randn(
+                 num_tokens + num_reqs,
+                 logits.shape[-1],
+@@ -4840,10 +4905,10 @@
+                 dtype=logits.dtype,
+             )
+             self.rejection_sampler(
+-                dummy_spec_decode_metadata,
+-                draft_probs,
+-                logits,
+-                dummy_metadata,
++                metadata=dummy_spec_decode_metadata,
++                draft_logits=None,
++                logits=logits,
++                sampling_metadata=dummy_metadata,
+             )
+         return sampler_output
+ 
